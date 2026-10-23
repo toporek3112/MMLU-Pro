@@ -1,0 +1,92 @@
+{
+  "biology": {
+    "corr": 164.0,
+    "wrong": 553.0,
+    "unknown": 114.0,
+    "acc": 0.22873082287308227
+  },
+  "business": {
+    "corr": 105.0,
+    "wrong": 684.0,
+    "unknown": 16.0,
+    "acc": 0.13307984790874525
+  },
+  "chemistry": {
+    "corr": 150.0,
+    "wrong": 982.0,
+    "unknown": 242.0,
+    "acc": 0.13250883392226148
+  },
+  "computer science": {
+    "corr": 60.0,
+    "wrong": 350.0,
+    "unknown": 64.0,
+    "acc": 0.14634146341463414
+  },
+  "economics": {
+    "corr": 160.0,
+    "wrong": 684.0,
+    "unknown": 51.0,
+    "acc": 0.1895734597156398
+  },
+  "engineering": {
+    "corr": 136.0,
+    "wrong": 833.0,
+    "unknown": 74.0,
+    "acc": 0.14035087719298245
+  },
+  "health": {
+    "corr": 152.0,
+    "wrong": 666.0,
+    "unknown": 29.0,
+    "acc": 0.18581907090464547
+  },
+  "history": {
+    "corr": 62.0,
+    "wrong": 319.0,
+    "unknown": 13.0,
+    "acc": 0.16272965879265092
+  },
+  "law": {
+    "corr": 121.0,
+    "wrong": 980.0,
+    "unknown": 103.0,
+    "acc": 0.10990009082652134
+  },
+  "math": {
+    "corr": 216.0,
+    "wrong": 1135.0,
+    "unknown": 298.0,
+    "acc": 0.15988156920799407
+  },
+  "other": {
+    "corr": 141.0,
+    "wrong": 783.0,
+    "unknown": 16.0,
+    "acc": 0.1525974025974026
+  },
+  "philosophy": {
+    "corr": 83.0,
+    "wrong": 416.0,
+    "unknown": 24.0,
+    "acc": 0.16633266533066132
+  },
+  "physics": {
+    "corr": 217.0,
+    "wrong": 1082.0,
+    "unknown": 103.0,
+    "acc": 0.16705157813702848
+  },
+  "psychology": {
+    "corr": 151.0,
+    "wrong": 647.0,
+    "unknown": 6.0,
+    "acc": 0.18922305764411027
+  },
+  "total": {
+    "corr": 1918.0,
+    "wrong": 10114.0,
+    "unknown": 1153.0,
+    "acc": 0.15940824468085107
+  }
+}

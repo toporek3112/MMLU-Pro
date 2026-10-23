@@ -1,0 +1,4 @@
+Phi-3-mini-4k-instruct,CoT,history,10-20_15-26,0.44356955264154974
+Phi-3-mini-4k-instruct,CoT,history,10-20_15-33,0.44356955264154974
+Phi-3-mini-4k-instruct,CoT,all,10-20_15-43,0.4747340425137355
+gemma-2b,CoT,all,10-20_18-25,0.15915890956124013

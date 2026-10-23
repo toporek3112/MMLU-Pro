@@ -1,0 +1,71 @@
+2026-10-20 18:30:36,299 INFO selected subjects:
+business
+law
+psychology
+biology
+chemistry
+history
+other
+health
+economics
+math
+physics
+computer science
+philosophy
+engineering
+2026-10-20 18:30:36,301 INFO evaluating biology
+2026-10-20 18:33:12,154 INFO 717size batch costing time: 153.04625844955444
+2026-10-20 18:34:07,476 INFO this batch accu is: 0.22733612273361228, corr: 163.0, wrong: 554.0
+
+2026-10-20 18:34:07,490 INFO evaluating business
+2026-10-20 18:35:21,189 INFO 789size batch costing time: 71.31573033332825
+2026-10-20 18:35:23,321 INFO this batch accu is: 0.1267427122940431, corr: 100.0, wrong: 689.0
+
+2026-10-20 18:35:23,328 INFO evaluating chemistry
+2026-10-20 18:40:37,334 INFO 1132size batch costing time: 310.2291874885559
+2026-10-20 18:41:37,988 INFO this batch accu is: 0.14575971731448764, corr: 165.0, wrong: 967.0
+
+2026-10-20 18:41:38,007 INFO evaluating computer science
+2026-10-20 18:42:56,783 INFO 410size batch costing time: 77.19971132278442
+2026-10-20 18:43:10,134 INFO this batch accu is: 0.16341463414634147, corr: 67.0, wrong: 343.0
+
+2026-10-20 18:43:10,144 INFO evaluating economics
+2026-10-20 18:44:38,329 INFO 844size batch costing time: 85.36130023002625
+2026-10-20 18:44:52,647 INFO this batch accu is: 0.17890995260663506, corr: 151.0, wrong: 693.0
+
+2026-10-20 18:44:52,658 INFO evaluating engineering
+2026-10-20 18:47:16,274 INFO 969size batch costing time: 140.87335062026978
+2026-10-20 18:47:27,326 INFO this batch accu is: 0.14035087719298245, corr: 136.0, wrong: 833.0
+
+2026-10-20 18:47:27,339 INFO evaluating health
+2026-10-20 18:48:35,972 INFO 818size batch costing time: 66.1273889541626
+2026-10-20 18:48:48,836 INFO this batch accu is: 0.17726161369193155, corr: 145.0, wrong: 673.0
+
+2026-10-20 18:48:48,844 INFO evaluating history
+2026-10-20 18:49:45,622 INFO 381size batch costing time: 51.947643518447876
+2026-10-20 18:49:51,912 INFO this batch accu is: 0.17060367454068243, corr: 65.0, wrong: 316.0
+
+2026-10-20 18:49:51,920 INFO evaluating law
+2026-10-20 18:52:22,043 INFO 1101size batch costing time: 145.48728442192078
+2026-10-20 18:53:12,676 INFO this batch accu is: 0.10535876475930972, corr: 116.0, wrong: 985.0
+
+2026-10-20 18:53:12,697 INFO evaluating math
+2026-10-20 18:59:23,583 INFO 1351size batch costing time: 366.1585443019867
+2026-10-20 18:59:58,013 INFO this batch accu is: 0.15766099185788304, corr: 213.0, wrong: 1138.0
+
+2026-10-20 18:59:58,030 INFO evaluating other
+2026-10-20 19:01:04,446 INFO 924size batch costing time: 64.07599973678589
+2026-10-20 19:01:11,086 INFO this batch accu is: 0.16233766233766234, corr: 150.0, wrong: 774.0
+
+2026-10-20 19:01:11,099 INFO evaluating philosophy
+2026-10-20 19:02:08,082 INFO 499size batch costing time: 55.73491311073303
+2026-10-20 19:02:13,702 INFO this batch accu is: 0.1683366733466934, corr: 84.0, wrong: 415.0
+
+2026-10-20 19:02:13,709 INFO evaluating physics
+2026-10-20 19:05:23,313 INFO 1299size batch costing time: 185.71553087234497
+2026-10-20 19:05:59,241 INFO this batch accu is: 0.15165511932255582, corr: 197.0, wrong: 1102.0
+
+2026-10-20 19:05:59,254 INFO evaluating psychology
+2026-10-20 19:07:02,233 INFO 798size batch costing time: 60.37101221084595
+2026-10-20 19:07:05,127 INFO this batch accu is: 0.19298245614035087, corr: 154.0, wrong: 644.0
+

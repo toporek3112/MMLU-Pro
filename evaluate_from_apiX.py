@@ -8,6 +8,7 @@ import argparse
 import sys
 import select
 import asyncio
+import random
 
 try:
     import termios
@@ -21,7 +22,7 @@ except ImportError:
 from collections import deque
 from openai import AsyncOpenAI
 from datasets import load_dataset
-import tiktoken
+from transformers import AutoTokenizer
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -37,9 +38,10 @@ from rich import box
 # Global Configuration & Patterns
 # -------------------------------------------------------------------------
 _PATTERNS = (r"answer is \(?([A-J])\)?", r"[aA]nswer:\s*([A-J])", r"\b[A-J]\b")
-API_KEY = ""
+API_KEY = os.environ.get("OPENAI_API_KEY", "EMPTY")
 args = None
 GLOBAL_TOKENIZER = None
+FALLBACK_SEED = 12345
 
 console = Console()
 
@@ -114,10 +116,26 @@ _STALL_THRESHOLD_SECS = 25.0
 
 
 def get_tokenizer():
+    """Load the tokenizer used by the served model for prompt-length checks."""
     global GLOBAL_TOKENIZER
     if GLOBAL_TOKENIZER is None:
-        GLOBAL_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+        tokenizer_name = args.tokenizer_name or args.model_name
+        GLOBAL_TOKENIZER = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            revision=args.tokenizer_revision,
+            trust_remote_code=True,
+        )
     return GLOBAL_TOKENIZER
+
+
+def count_tokens(text, add_special_tokens=True):
+    tokenizer = get_tokenizer()
+    return len(
+        tokenizer.encode(
+            text,
+            add_special_tokens=add_special_tokens,
+        )
+    )
 
 
 # -------------------------------------------------------------------------
@@ -134,14 +152,14 @@ AUTO_SCROLL = True  # auto-follow active questions; disabled on manual scroll
 # API Client
 # -------------------------------------------------------------------------
 def get_async_client():
-    return AsyncOpenAI(api_key=API_KEY, base_url=args.url, timeout=3600.0)
+    return AsyncOpenAI(api_key=API_KEY, base_url=args.url, timeout=args.request_timeout)
 
 
 # -------------------------------------------------------------------------
 # Data Loading & Preprocessing
 # -------------------------------------------------------------------------
 def load_mmlu_pro():
-    dataset = load_dataset("TIGER-Lab/MMLU-Pro")
+    dataset = load_dataset("TIGER-Lab/MMLU-Pro", revision=args.dataset_revision)
     test_df, val_df = dataset["test"], dataset["validation"]
     return preprocess(test_df), preprocess(val_df)
 
@@ -158,20 +176,60 @@ def preprocess(raw):
     return grouped
 
 
-def format_example(question, options, cot_content=""):
-    if not cot_content:
-        cot_content = "Let's think step by step."
-    if cot_content.startswith("A: "):
-        cot_content = cot_content[3:]
-    example = f"Question: {question}\nOptions: "
-    choice_map = "ABCDEFGHIJ"
-    for i, opt in enumerate(options):
-        example += f"{choice_map[i]}. {opt}\n"
-    if cot_content:
-        example += f"Answer: {cot_content}\n\n"
+CHOICES = "ABCDEFGHIJ"
+
+
+def format_cot_example(example, including_answer=True):
+    """Match evaluate_from_local.py's MMLU-Pro CoT prompt format."""
+    prompt = "Question:\n"
+    prompt += example["question"] + "\n"
+    prompt += "Options:\n"
+    for i, opt in enumerate(example["options"]):
+        prompt += f"{CHOICES[i]}. {opt}\n"
+
+    if including_answer:
+        cot_content = example["cot_content"].replace(
+            "A: Let's think step by step.",
+            "Answer: Let's think step by step.",
+        )
+        prompt += cot_content + "\n\n"
     else:
-        example += "Answer: "
-    return example
+        prompt += "Answer: Let's think step by step."
+    return prompt
+
+
+def generate_cot_prompt(dev_df, curr, k):
+    """Build the same k-shot CoT prompt as evaluate_from_local.py."""
+    initial_prompt_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "cot_prompt_lib",
+        "initial_prompt.txt",
+    )
+    with open(initial_prompt_path, "r") as fi:
+        prompt = fi.read()
+
+    subject = curr["category"]
+    prompt = prompt.replace("{$}", subject) + "\n"
+    for example in dev_df[subject][:k]:
+        prompt += format_cot_example(example, including_answer=True)
+    prompt += format_cot_example(curr, including_answer=False)
+    return prompt
+
+
+def build_prompt(dev_df, curr):
+    """Build a prompt and reduce shots until it fits the configured context budget."""
+    if args.ntrain < 0:
+        raise ValueError("--ntrain must be >= 0")
+
+    k = args.ntrain
+    while k >= 0:
+        prompt = generate_cot_prompt(dev_df, curr, k)
+        prompt_tokens = count_tokens(prompt, add_special_tokens=True)
+        if prompt_tokens < args.max_model_length - args.max_output_tokens:
+            return prompt, k, prompt_tokens
+        k -= 1
+
+    raise MaxTokensExceeded(f"Prompt does not fit even with 0 shots: max_model_length={args.max_model_length}, max_output_tokens={args.max_output_tokens}")
 
 
 def extract_answer(text):
@@ -217,9 +275,7 @@ class ActiveQuestionTracker:
         self.question_results = {}
         self.log_messages = []
         self.last_render_time = 0
-        self.render_interval = (
-            1.0  # Reduced to 1 second to avoid interfering with input
-        )
+        self.render_interval = 1.0  # Reduced to 1 second to avoid interfering with input
 
         # Cache terminal size
         self.last_cols = 0
@@ -233,9 +289,7 @@ class ActiveQuestionTracker:
         self._stall_pulse = False  # flips each render tick
 
         self.log(f"Starting {subject} ({total_questions} questions)")
-        self.log(
-            f"Controls: [Up/Down] Scroll (disables auto-scroll) | [r] restart | [k] kill | [q] quit"
-        )
+        self.log(f"Controls: [Up/Down] Scroll (disables auto-scroll) | [r] restart | [k] kill | [q] quit")
         if args.retry > 0:
             self.log(f"Max token retries: {args.retry}")
 
@@ -291,9 +345,7 @@ class ActiveQuestionTracker:
                     self.token_rates[question_num] = 0.0
                 self.stalled[question_num] = False
                 rate = self.token_rates.get(question_num, 0.0)
-                buffer_update_question(
-                    question_num, tokens=token_count, rate=rate, stalled=False
-                )
+                buffer_update_question(question_num, tokens=token_count, rate=rate, stalled=False)
                 return
 
             self.token_counts[question_num] = token_count
@@ -313,9 +365,7 @@ class ActiveQuestionTracker:
 
             self.stalled[question_num] = False
 
-        buffer_update_question(
-            question_num, tokens=token_count, rate=rate, stalled=False
-        )
+        buffer_update_question(question_num, tokens=token_count, rate=rate, stalled=False)
 
     def set_stalled(self, question_num, stalled):
         with self.lock:
@@ -347,9 +397,7 @@ class ActiveQuestionTracker:
     def kill_question(self, question_num):
         with self.lock:
             if question_num in self.active_questions:
-                task, start_time, stop_event, _, _, retry_count = self.active_questions[
-                    question_num
-                ]
+                task, start_time, stop_event, _, _, retry_count = self.active_questions[question_num]
                 self.active_questions[question_num] = (
                     task,
                     start_time,
@@ -369,9 +417,7 @@ class ActiveQuestionTracker:
     def restart_question(self, question_num):
         with self.lock:
             if question_num in self.active_questions:
-                task, start_time, stop_event, _, _, retry_count = self.active_questions[
-                    question_num
-                ]
+                task, start_time, stop_event, _, _, retry_count = self.active_questions[question_num]
                 self.active_questions[question_num] = (
                     task,
                     start_time,
@@ -391,9 +437,7 @@ class ActiveQuestionTracker:
     def increment_retry_count(self, question_num):
         with self.lock:
             if question_num in self.active_questions:
-                task, start_time, stop_event, restart_flag, kill_flag, retry_count = (
-                    self.active_questions[question_num]
-                )
+                task, start_time, stop_event, restart_flag, kill_flag, retry_count = self.active_questions[question_num]
                 retry_count += 1
                 self.active_questions[question_num] = (
                     task,
@@ -416,18 +460,14 @@ class ActiveQuestionTracker:
     def get_flags(self, question_num):
         with self.lock:
             if question_num in self.active_questions:
-                _, _, _, restart_flag, kill_flag, _ = self.active_questions[
-                    question_num
-                ]
+                _, _, _, restart_flag, kill_flag, _ = self.active_questions[question_num]
                 return restart_flag, kill_flag
             return False, False
 
     def clear_flags(self, question_num):
         with self.lock:
             if question_num in self.active_questions:
-                task, start_time, stop_event, _, _, retry_count = self.active_questions[
-                    question_num
-                ]
+                task, start_time, stop_event, _, _, retry_count = self.active_questions[question_num]
                 self.active_questions[question_num] = (
                     task,
                     start_time,
@@ -439,9 +479,7 @@ class ActiveQuestionTracker:
 
     def stop_all_questions(self):
         with self.lock:
-            for question_num, (task, start_time, stop_event, _, _, _) in list(
-                self.active_questions.items()
-            ):
+            for question_num, (task, start_time, stop_event, _, _, _) in list(self.active_questions.items()):
                 if stop_event:
                     stop_event.set()
                 if task and not task.done() and self.loop:
@@ -459,9 +497,7 @@ class ActiveQuestionTracker:
             return any(self.stalled.values())
 
     def calculate_accuracy(self):
-        finished = [
-            v for v in self.question_results.values() if v in ("success", "wrong")
-        ]
+        finished = [v for v in self.question_results.values() if v in ("success", "wrong")]
         total = len(finished)
         if total == 0:
             return 0.0
@@ -593,11 +629,7 @@ class ActiveQuestionTracker:
 
             if is_stalled:
                 # Feature 10: pulse row style between bold-red and dim-red
-                row_style = (
-                    Style(bold=True, color="red")
-                    if self._stall_pulse
-                    else Style(color="dark_red")
-                )
+                row_style = Style(bold=True, color="red") if self._stall_pulse else Style(color="dark_red")
                 indicator = Text("!", style="bold red")
             else:
                 row_style = Style(color=age_sty)
@@ -689,9 +721,7 @@ class ActiveQuestionTracker:
                             f"{q_num:03d}",
                             style=Style(bold=True, color="white", bgcolor="red"),
                         )
-                        item.append(
-                            "!", style=Style(bold=True, color="white", bgcolor="red")
-                        )
+                        item.append("!", style=Style(bold=True, color="white", bgcolor="red"))
                     else:
                         item.append(f"{q_num:03d}", style=Style(bold=True, color="red"))
                         item.append("!", style=Style(bold=True, color="red"))
@@ -760,9 +790,7 @@ class ActiveQuestionTracker:
         controls.append(auto_lbl + "  ", style="bold cyan" if AUTO_SCROLL else "dim")
         controls.append("[q] ", style="bold magenta")
         controls.append("quit  ", style="dim")
-        controls.append(
-            f"│  active {len(active_qs)}/{self.max_concurrent}", style="dim"
-        )
+        controls.append(f"│  active {len(active_qs)}/{self.max_concurrent}", style="dim")
 
         # ----------------------------------------------------------------
         # Feature 1: Two-column Layout assembly
@@ -805,20 +833,11 @@ class ActiveQuestionTracker:
 # FIX: SSH-compatible terminal handling - avoid switching between cbreak/canonical modes
 # -------------------------------------------------------------------------
 def keyboard_listener(tracker, event_loop):
-    global \
-        GLOBAL_QUIT_REQUESTED, \
-        SCROLL_OFFSET, \
-        INPUT_PROMPT_ACTIVE, \
-        AUTO_SCROLL, \
-        RENDERING_ACTIVE
+    global GLOBAL_QUIT_REQUESTED, SCROLL_OFFSET, INPUT_PROMPT_ACTIVE, AUTO_SCROLL, RENDERING_ACTIVE
 
     if not UNIX_TERMINAL:
-        console.print(
-            "\n[yellow]Terminal input not available on this platform - running in non-interactive mode[/yellow]"
-        )
-        console.print(
-            "[dim]Note: Keyboard controls (r, k, q, arrow keys) are disabled.[/dim]"
-        )
+        console.print("\n[yellow]Terminal input not available on this platform - running in non-interactive mode[/yellow]")
+        console.print("[dim]Note: Keyboard controls (r, k, q, arrow keys) are disabled.[/dim]")
         while tracker.keyboard_listener_active and not GLOBAL_QUIT_REQUESTED:
             time.sleep(1)
         return
@@ -827,9 +846,7 @@ def keyboard_listener(tracker, event_loop):
     try:
         old_settings = termios.tcgetattr(fd)
     except termios.error:
-        console.print(
-            "\n[red]Terminal not available - running in non-interactive mode[/red]"
-        )
+        console.print("\n[red]Terminal not available - running in non-interactive mode[/red]")
         return
 
     input_buffer = []
@@ -989,11 +1006,7 @@ def keyboard_listener(tracker, event_loop):
                         rate = rate_snap.get(q_num, 0.0)
                         is_stalled = stalled_snap.get(q_num, False)
 
-                        state_txt = (
-                            Text("STALLED", style="bold red")
-                            if is_stalled
-                            else Text("active", style="green")
-                        )
+                        state_txt = Text("STALLED", style="bold red") if is_stalled else Text("active", style="green")
 
                         if q_elapsed < 30:
                             row_sty = "white"
@@ -1015,9 +1028,7 @@ def keyboard_listener(tracker, event_loop):
                         )
 
                     console.print(pick_table)
-                    q_input = restore_terminal_and_get_input(
-                        f"  Q number to {action} (Enter to cancel): "
-                    )
+                    q_input = restore_terminal_and_get_input(f"  Q number to {action} (Enter to cancel): ")
 
                     if live is not None:
                         live.start()
@@ -1053,12 +1064,8 @@ def keyboard_listener(tracker, event_loop):
 # -------------------------------------------------------------------------
 # Streaming Request
 # -------------------------------------------------------------------------
-async def streaming_request(
-    client, prompt, input_text, tracker, question_num, stop_event
-):
-    encoding = get_tokenizer()
-    full_messages = [{"role": "user", "content": prompt + input_text}]
-    prompt_tokens = len(encoding.encode(prompt + input_text))
+async def streaming_request(client, full_prompt, tracker, question_num, stop_event):
+    prompt_tokens = count_tokens(full_prompt, add_special_tokens=True)
     total_tokens = prompt_tokens
     tracker.update_token(question_num, total_tokens)
     buffer_update_question(question_num, tokens=total_tokens, status="active")
@@ -1066,71 +1073,97 @@ async def streaming_request(
     full_response_parts = []
     usage_data = None
     stream = None
+
+    request_kwargs = {
+        "model": args.model_name,
+        "temperature": args.temperature,
+        "max_tokens": args.max_output_tokens,
+        "top_p": args.top_p,
+        "stream": True,
+    }
+    if args.stop_sequence:
+        request_kwargs["stop"] = [args.stop_sequence]
+
     try:
-        async with asyncio.timeout(3600):
-            stream = await client.chat.completions.create(
-                model=args.model_name,
-                messages=full_messages,
-                temperature=0.1,
-                max_tokens=args.max_tokens,
-                top_p=0.95,
-                stream=True,
-                #                extra_body={"repetition_penalty": 1.05},
-                stream_options={"include_usage": True},
-            )
+        async with asyncio.timeout(args.request_timeout):
+            if args.api_mode == "completion":
+                stream = await client.completions.create(
+                    prompt=full_prompt,
+                    **request_kwargs,
+                )
+            else:
+                stream = await client.chat.completions.create(
+                    messages=[{"role": "user", "content": full_prompt}],
+                    **request_kwargs,
+                )
+
             async for chunk in stream:
                 if stop_event.is_set():
                     raise asyncio.CancelledError("Stop requested")
-                if hasattr(chunk, "usage") and chunk.usage:
+
+                if getattr(chunk, "usage", None):
                     usage_data = chunk.usage
                     continue
-                if chunk.choices:
+
+                if not chunk.choices:
+                    continue
+
+                if args.api_mode == "completion":
+                    content = chunk.choices[0].text or ""
+                    thinking = ""
+                else:
                     delta = chunk.choices[0].delta
-                    content = delta.content or ""
-                    thinking = (
-                        getattr(delta, "reasoning_content", None)
-                        or getattr(delta, "reasoning", None)
-                        or ""
-                    )
-                    if content or thinking:
-                        combined_text = thinking + content
-                        delta_tokens = len(encoding.encode(combined_text))
-                        total_tokens += delta_tokens
-                        # Normal streaming update — rate calculation included
-                        tracker.update_token(question_num, total_tokens)
-                        buffer_update_question(
-                            question_num, tokens=total_tokens, status="active"
-                        )
+                    content = getattr(delta, "content", None) or ""
+                    thinking = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None) or ""
 
-                        if total_tokens > args.max_tokens:
-                            raise MaxTokensExceeded(
-                                f"Token count {total_tokens} exceeds max_tokens {args.max_tokens}"
-                            )
+                if not content and not thinking:
+                    continue
 
-                        if args.save_thinking:
-                            full_response_parts.append(combined_text)
-                        else:
-                            if content:
-                                full_response_parts.append(content)
+                combined_text = thinking + content
+                delta_tokens = count_tokens(
+                    combined_text,
+                    add_special_tokens=False,
+                )
+                total_tokens += delta_tokens
+                tracker.update_token(question_num, total_tokens)
+                buffer_update_question(
+                    question_num,
+                    tokens=total_tokens,
+                    status="active",
+                )
 
-            if usage_data is None:
-                raise MissingUsageError("Server did not provide usage statistics")
+                if total_tokens > args.max_model_length:
+                    raise MaxTokensExceeded(f"Estimated total token count {total_tokens} exceeds max_model_length {args.max_model_length}")
 
-            # FIX 3: Use count_only=True so the authoritative server token count is
-            # stored without triggering a rate recalculation.  The client-side
-            # estimated total_tokens may differ from usage_data.total_tokens, and
-            # applying it as a normal delta update would cause a huge momentary spike
-            # (large count jump / near-zero dt = infinite apparent tok/s).
-            total_tokens = usage_data.total_tokens
+                if args.save_thinking:
+                    full_response_parts.append(combined_text)
+                elif content:
+                    full_response_parts.append(content)
+
+            response_text = "".join(full_response_parts)
+
+            # Prefer authoritative server usage when available, but do not make
+            # correctness depend on every OpenAI-compatible backend implementing it.
+            if usage_data is not None and usage_data.total_tokens is not None:
+                total_tokens = usage_data.total_tokens
+            else:
+                total_tokens = prompt_tokens + count_tokens(
+                    response_text,
+                    add_special_tokens=False,
+                )
+
             tracker.update_token(question_num, total_tokens, count_only=True)
-            buffer_update_question(question_num, tokens=total_tokens, status="active")
+            buffer_update_question(
+                question_num,
+                tokens=total_tokens,
+                status="active",
+            )
 
-        return "".join(full_response_parts), total_tokens
+            return response_text, total_tokens
 
     except (
         asyncio.CancelledError,
         MaxTokensExceeded,
-        MissingUsageError,
         asyncio.TimeoutError,
         Exception,
     ):
@@ -1149,33 +1182,47 @@ async def streaming_request(
 def update_result(output_res_path):
     category_record = {}
     res = []
-    success = False
-    while not success:
+
+    while True:
         try:
             if os.path.exists(output_res_path):
                 with open(output_res_path, "r") as fi:
                     res = json.load(fi)
-                for each in res:
-                    cat = each["category"]
-                    category_record.setdefault(cat, {"corr": 0.0, "wrong": 0.0})
-                    if not each.get("pred"):
-                        category_record[cat]["wrong"] += 1
-                    elif each["pred"] == each["answer"]:
-                        category_record[cat]["corr"] += 1
-                    else:
-                        category_record[cat]["wrong"] += 1
-            success = True
+            break
         except Exception:
             time.sleep(2)
+
+    # MMLU-Pro uses a random-choice fallback when no answer can be extracted.
+    # Reinitialize the RNG for every scoring pass so repeated summary updates are
+    # deterministic and independent of asynchronous request completion order.
+    rng = random.Random(FALLBACK_SEED)
+
+    for each in sorted(res, key=lambda item: item["question_id"]):
+        cat = each["category"]
+        category_record.setdefault(
+            cat,
+            {"corr": 0.0, "wrong": 0.0, "unknown": 0.0},
+        )
+
+        pred = each.get("pred")
+        if pred is None:
+            category_record[cat]["unknown"] += 1
+            fallback_index = rng.randint(0, len(each["options"]) - 1)
+            is_correct = fallback_index == each["answer_index"]
+        else:
+            is_correct = pred == each["answer"]
+
+        if is_correct:
+            category_record[cat]["corr"] += 1
+        else:
+            category_record[cat]["wrong"] += 1
+
     return res, category_record
 
 
 def merge_result(res, curr):
     for i, entry in enumerate(res):
-        if (
-            entry["question_id"] == curr["question_id"]
-            and entry["question"] == curr["question"]
-        ):
+        if entry["question_id"] == curr["question_id"] and entry["question"] == curr["question"]:
             res[i] = curr
             return res
     res.append(curr)
@@ -1195,45 +1242,83 @@ def save_res(res, output_res_path):
 
 
 def save_summary(category_record, output_summary_path):
-    total_corr = total_wrong = 0.0
+    total_corr = total_wrong = total_unknown = 0.0
     for cat, stats in category_record.items():
         if cat == "total":
             continue
-        acc = (
-            (stats["corr"] / (stats["corr"] + stats["wrong"]))
-            if (stats["corr"] + stats["wrong"]) > 0
-            else 0
-        )
+        acc = (stats["corr"] / (stats["corr"] + stats["wrong"])) if (stats["corr"] + stats["wrong"]) > 0 else 0
         category_record[cat]["acc"] = acc
         total_corr += stats["corr"]
         total_wrong += stats["wrong"]
+        total_unknown += stats.get("unknown", 0.0)
     overall = {
         "corr": total_corr,
         "wrong": total_wrong,
-        "acc": total_corr / (total_corr + total_wrong)
-        if (total_corr + total_wrong) > 0
-        else 0,
+        "unknown": total_unknown,
+        "acc": total_corr / (total_corr + total_wrong) if (total_corr + total_wrong) > 0 else 0,
     }
     category_record["total"] = overall
     with open(output_summary_path, "w") as fo:
         fo.write(json.dumps(category_record))
 
 
+def save_overall_summary(subjects):
+    category_record = {}
+    total_corr = 0.0
+    total_wrong = 0.0
+    total_unknown = 0.0
+
+    for subject in subjects:
+        result_path = os.path.join(args.output_dir, f"{subject}_result.json")
+        if not os.path.exists(result_path):
+            continue
+
+        _, stats = update_result(result_path)
+        subject_stats = stats.get(
+            subject,
+            {"corr": 0.0, "wrong": 0.0, "unknown": 0.0},
+        )
+        corr = subject_stats["corr"]
+        wrong = subject_stats["wrong"]
+        unknown = subject_stats.get("unknown", 0.0)
+        total = corr + wrong
+
+        category_record[subject] = {
+            "corr": corr,
+            "wrong": wrong,
+            "unknown": unknown,
+            "acc": corr / total if total else 0.0,
+        }
+        total_corr += corr
+        total_wrong += wrong
+        total_unknown += unknown
+
+    total = total_corr + total_wrong
+    category_record["total"] = {
+        "corr": total_corr,
+        "wrong": total_wrong,
+        "unknown": total_unknown,
+        "acc": total_corr / total if total else 0.0,
+    }
+
+    output_path = os.path.join(args.output_dir, "overall_summary.json")
+    with open(output_path, "w") as fo:
+        json.dump(category_record, fo, indent=2)
+
+    return category_record
+
+
 # -------------------------------------------------------------------------
 # Evaluation Worker
 # -------------------------------------------------------------------------
-async def evaluate_subject_async(
-    subject, test_data, dev_df, output_res_path, total_q, num_workers
-):
+async def evaluate_subject_async(subject, test_data, dev_df, output_res_path, total_q, num_workers):
     global RENDERING_ACTIVE
     buffer_clear()
     RENDERING_ACTIVE = True
 
     client = get_async_client()
     event_loop = asyncio.get_event_loop()
-    tracker = ActiveQuestionTracker(
-        subject, total_q, max_concurrent=num_workers, loop=event_loop
-    )
+    tracker = ActiveQuestionTracker(subject, total_q, max_concurrent=num_workers, loop=event_loop)
 
     keyboard_thread = threading.Thread(
         target=keyboard_listener,
@@ -1264,22 +1349,15 @@ async def evaluate_subject_async(
                 if ex.get("model_outputs") == "MaxTokensExceeded":
                     maxtoken_ids.add(ex["question_id"])
             if maxtoken_ids:
-                tracker.log(
-                    f"Found {len(maxtoken_ids)} questions to rerun (MaxTokensExceeded)"
-                )
+                tracker.log(f"Found {len(maxtoken_ids)} questions to rerun (MaxTokensExceeded)")
             else:
                 tracker.log("No MaxTokensExceeded questions found to rerun")
         if rerun_unknown:
             for ex in existing_res:
-                if (
-                    ex.get("pred") is None
-                    and ex.get("model_outputs") != "MaxTokensExceeded"
-                ):
+                if ex.get("pred") is None and ex.get("model_outputs") != "MaxTokensExceeded":
                     unknown_ids.add(ex["question_id"])
             if unknown_ids:
-                tracker.log(
-                    f"Found {len(unknown_ids)} questions to rerun (Unknown prediction)"
-                )
+                tracker.log(f"Found {len(unknown_ids)} questions to rerun (Unknown prediction)")
             else:
                 tracker.log("No Unknown prediction questions found to rerun")
 
@@ -1287,9 +1365,7 @@ async def evaluate_subject_async(
         rerun_ids = maxtoken_ids | unknown_ids
         for idx, each in enumerate(test_data):
             if each["question_id"] in processed_ids:
-                if (rerun_maxtoken or rerun_unknown) and each[
-                    "question_id"
-                ] in rerun_ids:
+                if (rerun_maxtoken or rerun_unknown) and each["question_id"] in rerun_ids:
                     pending.append((idx, each))
                     tracker.question_results[idx + 1] = "pending"
                 else:
@@ -1298,11 +1374,7 @@ async def evaluate_subject_async(
                         if ex["question_id"] == each["question_id"]:
                             pred = ex.get("pred")
                             ans = ex.get("answer")
-                            res_status = (
-                                "success"
-                                if pred == ans and pred is not None
-                                else "wrong"
-                            )
+                            res_status = "success" if pred == ans and pred is not None else "wrong"
                             tracker.question_results[idx + 1] = res_status
                             break
             else:
@@ -1316,10 +1388,15 @@ async def evaluate_subject_async(
 
         async def enforce_start_delay():
             nonlocal last_start_time
+            if args.request_start_delay <= 0:
+                return
             async with start_lock:
                 now = time.time()
                 if last_start_time > 0:
-                    delay = max(0.0, 2.0 - (now - last_start_time))
+                    delay = max(
+                        0.0,
+                        args.request_start_delay - (now - last_start_time),
+                    )
                     if delay > 0:
                         await asyncio.sleep(delay)
                 last_start_time = time.time()
@@ -1339,23 +1416,14 @@ async def evaluate_subject_async(
                 for ex in existing_res:
                     if each["question_id"] == ex["question_id"]:
                         should_rerun = False
-                        if (
-                            rerun_mode_maxtoken
-                            and ex.get("model_outputs") == "MaxTokensExceeded"
-                        ):
+                        if rerun_mode_maxtoken and ex.get("model_outputs") == "MaxTokensExceeded":
                             should_rerun = True
-                        if (
-                            rerun_mode_unknown
-                            and ex.get("pred") is None
-                            and ex.get("model_outputs") != "MaxTokensExceeded"
-                        ):
+                        if rerun_mode_unknown and ex.get("pred") is None and ex.get("model_outputs") != "MaxTokensExceeded":
                             should_rerun = True
                         if should_rerun:
                             pass
                         else:
-                            tracker.complete_question(
-                                question_num, token_count=0, success=False
-                            )
+                            tracker.complete_question(question_num, token_count=0, success=False)
                             return
 
             task = asyncio.current_task()
@@ -1385,9 +1453,7 @@ async def evaluate_subject_async(
                             res, _ = update_result(output_res_path)
                             res = merge_result(res, each)
                             save_res(res, output_res_path)
-                        tracker.complete_question(
-                            question_num, token_count=0, success=False
-                        )
+                        tracker.complete_question(question_num, token_count=0, success=False)
                         return
 
                     if restart_flag:
@@ -1400,25 +1466,18 @@ async def evaluate_subject_async(
                         await asyncio.sleep(1)
                         continue
 
-                    category = each["category"]
-                    cot_examples = dev_df[category]
-                    prompt = (
-                        f"The following are multiple choice questions (with answers) about {category}. "
-                        f"Think step by step and then output the answer in the format of "
-                        f'"The answer is (X)" at the end.\n\n'
-                    )
-                    for ex in cot_examples:
-                        prompt += format_example(
-                            ex["question"], ex["options"], ex["cot_content"]
-                        )
-                    input_text = format_example(each["question"], each["options"])
-
                     try:
+                        full_prompt, used_ntrain, prompt_tokens = build_prompt(
+                            dev_df,
+                            each,
+                        )
+                        if used_ntrain != args.ntrain:
+                            tracker.log(f"Q{question_num} reduced shots {args.ntrain}->{used_ntrain} ({prompt_tokens} prompt tokens)")
+
                         await enforce_start_delay()
                         response, token_count = await streaming_request(
                             client,
-                            prompt,
-                            input_text,
+                            full_prompt,
                             tracker,
                             question_num,
                             stop_event,
@@ -1438,9 +1497,7 @@ async def evaluate_subject_async(
                                 res, _ = update_result(output_res_path)
                                 res = merge_result(res, each)
                                 save_res(res, output_res_path)
-                            tracker.complete_question(
-                                question_num, token_count=0, success=False
-                            )
+                            tracker.complete_question(question_num, token_count=0, success=False)
                             return
                         if restart_flag:
                             continue
@@ -1464,7 +1521,7 @@ async def evaluate_subject_async(
                             await asyncio.sleep(min(2**token_exceed_attempts, 30))
                             continue
 
-                    except (MissingUsageError, asyncio.TimeoutError, Exception) as e:
+                    except (asyncio.TimeoutError, Exception) as e:
                         tracker.log(f"Q{question_num} Err: {str(e)[:30]}")
                         tracker.increment_retry_count(question_num)
                         tracker.update_token(question_num, 0)
@@ -1497,25 +1554,22 @@ async def evaluate_subject_async(
                 return
 
             with file_lock:
-                res, category_record = update_result(output_res_path)
-                category_record.setdefault(subject, {"corr": 0.0, "wrong": 0.0})
+                res, _ = update_result(output_res_path)
                 each["pred"] = final_pred
                 each["model_outputs"] = final_response
-                if final_pred is not None and final_pred == each["answer"]:
-                    category_record[subject]["corr"] += 1
-                else:
-                    category_record[subject]["wrong"] += 1
                 res = merge_result(res, each)
                 save_res(res, output_res_path)
+
+                # Recalculate after saving so the newly completed question also
+                # receives the deterministic random-choice fallback if unparsed.
+                _, category_record = update_result(output_res_path)
                 save_summary(
                     category_record,
                     os.path.join(args.output_dir, f"{subject}_summary.json"),
                 )
 
             if final_pred is not None and final_pred == each["answer"]:
-                tracker.complete_question(
-                    question_num, token_count=final_token_count, success=True
-                )
+                tracker.complete_question(question_num, token_count=final_token_count, success=True)
             else:
                 tracker.complete_question(question_num, token_count=0, success=False)
 
@@ -1524,12 +1578,7 @@ async def evaluate_subject_async(
             if not INPUT_PROMPT_ACTIVE:
                 tracker.render_screen()
 
-            while (
-                len(running_tasks) < num_workers
-                and not tracker.any_stalled()
-                and pending
-                and not GLOBAL_QUIT_REQUESTED
-            ):
+            while len(running_tasks) < num_workers and not tracker.any_stalled() and pending and not GLOBAL_QUIT_REQUESTED:
                 idx, each = pending.pop(0)
                 q_num = idx + 1
                 task = asyncio.create_task(process_one(q_num, each))
@@ -1537,9 +1586,7 @@ async def evaluate_subject_async(
                 running_tasks.add(task)
 
             if running_tasks:
-                done, _ = await asyncio.wait(
-                    running_tasks, timeout=0.2, return_when=asyncio.FIRST_COMPLETED
-                )
+                done, _ = await asyncio.wait(running_tasks, timeout=0.2, return_when=asyncio.FIRST_COMPLETED)
                 for t in done:
                     running_tasks.discard(t)
                     q_num = task_to_qnum.pop(t, None)
@@ -1569,12 +1616,95 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", "-o", type=str, default="eval_results/")
     parser.add_argument("--model_name", "-m", type=str, default="local")
-    parser.add_argument("--assigned_subjects", "-a", type=str, default="all")
-    parser.add_argument("--url", "-u", type=str, default="http://127.0.0.1:8080/")
-    parser.add_argument("--num_workers", "-n", type=int, default=4)
+    parser.add_argument(
+        "--tokenizer-name",
+        "--tokenizer_name",
+        type=str,
+        default=None,
+        help="HF tokenizer used for prompt-length checks; defaults to --model_name",
+    )
+    parser.add_argument(
+        "--tokenizer-revision",
+        "--tokenizer_revision",
+        dest="tokenizer_revision",
+        type=str,
+        default=None,
+        help="Optional Hugging Face tokenizer revision/commit",
+    )
+    parser.add_argument(
+        "--dataset-revision",
+        "--dataset_revision",
+        dest="dataset_revision",
+        type=str,
+        default=None,
+        help="Optional MMLU-Pro dataset revision/commit",
+    )
+    parser.add_argument(
+        "--assigned_subjects",
+        "--selected_subjects",
+        "--selected-subjects",
+        "-a",
+        dest="assigned_subjects",
+        type=str,
+        default="all",
+    )
+    parser.add_argument("--url", "-u", type=str, default="http://127.0.0.1:8000/v1")
+    parser.add_argument("--num_workers", "-n", type=int, default=1)
     parser.add_argument("--retry", "-r", type=int, default=3)
-    parser.add_argument("--max_tokens", type=int, default=32768)
     parser.add_argument("--retry_wrong", type=int, default=0)
+    parser.add_argument(
+        "--ntrain",
+        "-k",
+        type=int,
+        default=5,
+        help="Number of MMLU-Pro validation demonstrations (5 for paper-compatible CoT)",
+    )
+    parser.add_argument(
+        "--api-mode",
+        choices=("completion", "chat"),
+        default="completion",
+        help="Use raw /v1/completions or chat-templated /v1/chat/completions",
+    )
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", "--top_p", dest="top_p", type=float, default=1.0)
+    parser.add_argument(
+        "--max-model-length",
+        "--max_model_length",
+        dest="max_model_length",
+        type=int,
+        default=4096,
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        "--max_output_tokens",
+        "--max_tokens",
+        dest="max_output_tokens",
+        type=int,
+        default=2048,
+        help="Maximum generated tokens; --max_tokens is retained as a compatibility alias",
+    )
+    parser.add_argument(
+        "--stop-sequence",
+        "--stop_sequence",
+        dest="stop_sequence",
+        type=str,
+        default="Question:",
+    )
+    parser.add_argument(
+        "--request-start-delay",
+        "--request_start_delay",
+        dest="request_start_delay",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between request starts; use 0 for local backends",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        "--request_timeout",
+        dest="request_timeout",
+        type=float,
+        default=3600.0,
+    )
     parser.add_argument("--save-thinking", action="store_true", default=False)
     parser.add_argument(
         "--rerun-maxtoken",
@@ -1590,24 +1720,40 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    assigned_subjects = (
-        [] if args.assigned_subjects == "all" else args.assigned_subjects.split(",")
-    )
+    if args.ntrain < 0:
+        parser.error("--ntrain must be >= 0")
+    if args.max_output_tokens <= 0:
+        parser.error("--max-output-tokens must be > 0")
+    if args.max_model_length <= args.max_output_tokens:
+        parser.error("--max-model-length must be greater than --max-output-tokens")
+    if args.retry_wrong > 0:
+        console.print("[yellow]Warning: --retry_wrong > 0 can bias benchmark accuracy upward.[/yellow]")
+
+    assigned_subjects = [] if args.assigned_subjects == "all" else args.assigned_subjects.split(",")
     os.makedirs(args.output_dir, exist_ok=True)
 
     test_df, dev_df = load_mmlu_pro()
     if not assigned_subjects:
         assigned_subjects = list(test_df.keys())
+    assigned_subjects = sorted(assigned_subjects)
+
+    run_config_path = os.path.join(args.output_dir, "run_config.json")
+    with open(run_config_path, "w") as fo:
+        json.dump(vars(args), fo, indent=2, sort_keys=True)
 
     console.print(f"Assigned subjects: {', '.join(assigned_subjects)}")
+    console.print(
+        "Evaluation config: "
+        f"api_mode={args.api_mode}, ntrain={args.ntrain}, "
+        f"temperature={args.temperature}, top_p={args.top_p}, "
+        f"context={args.max_model_length}, max_output={args.max_output_tokens}, "
+        f"tokenizer={args.tokenizer_name or args.model_name}, "
+        f"dataset_revision={args.dataset_revision or 'default'}"
+    )
     if args.rerun_maxtoken:
-        console.print(
-            "[yellow]--rerun-maxtoken enabled: will retry questions that previously failed with MaxTokensExceeded[/yellow]"
-        )
+        console.print("[yellow]--rerun-maxtoken enabled: will retry questions that previously failed with MaxTokensExceeded[/yellow]")
     if args.rerun_unknown:
-        console.print(
-            "[yellow]--rerun-unknown enabled: will retry questions where prediction was Unknown[/yellow]"
-        )
+        console.print("[yellow]--rerun-unknown enabled: will retry questions where prediction was Unknown[/yellow]")
 
     try:
         import uvloop
@@ -1659,9 +1805,13 @@ if __name__ == "__main__":
                         acc = summary["total"]["acc"] * 100
                         corr = int(summary["total"]["corr"])
                         wrong = int(summary["total"]["wrong"])
-                        console.print(
-                            f"\n  [bold]Final Accuracy for {subject}: "
-                            f"{acc:.2f}% ({corr}/{corr + wrong})[/bold]"
-                        )
+                        console.print(f"\n  [bold]Final Accuracy for {subject}: {acc:.2f}% ({corr}/{corr + wrong})[/bold]")
             except Exception:
                 pass
+
+    if not GLOBAL_QUIT_REQUESTED:
+        overall = save_overall_summary(assigned_subjects)
+        total = overall["total"]
+        console.print(f"\n[bold]Overall Accuracy: {total['acc'] * 100:.2f}% ({int(total['corr'])}/{int(total['corr'] + total['wrong'])})[/bold]")
+        if total.get("unknown", 0):
+            console.print(f"[yellow]Unknown/unparsed answers: {int(total['unknown'])}. These were scored using the deterministic MMLU-Pro random-choice fallback.[/yellow]")

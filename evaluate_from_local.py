@@ -19,6 +19,7 @@ max_model_length = 4096
 max_new_tokens = 2048
 random.seed(12345)
 
+
 def load_mmlu_pro():
     dataset = load_dataset("TIGER-Lab/MMLU-Pro")
     test_df, val_df = dataset["test"], dataset["validation"]
@@ -28,22 +29,20 @@ def load_mmlu_pro():
 
 
 def load_model():
-    llm = LLM(model=args.model, gpu_memory_utilization=float(args.gpu_util),
-                tensor_parallel_size=torch.cuda.device_count(),
-                max_model_len=max_model_length,
-                trust_remote_code=True,
-                enable_lora=True if args.lora_path else False)
-    sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens,
-                                        stop=["Question:"])
+    llm = LLM(
+        model=args.model,
+        gpu_memory_utilization=float(args.gpu_util),
+        tensor_parallel_size=torch.cuda.device_count(),
+        max_model_len=max_model_length,
+        trust_remote_code=True,
+        enable_lora=True if args.lora_path else False,
+    )
+    sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens, stop=["Question:"])
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     lora_request = None
     if args.lora_path:
-        lora_request = LoRARequest(
-            lora_name="lora",
-            lora_path=args.lora_path,
-            lora_int_id=1
-        )
+        lora_request = LoRARequest(lora_name="lora", lora_path=args.lora_path, lora_int_id=1)
 
     return (llm, sampling_params, lora_request), tokenizer
 
@@ -85,8 +84,9 @@ def format_cot_example(example, including_answer=True):
     for i, opt in enumerate(options):
         prompt += "{}. {}\n".format(choices[i], opt)
     if including_answer:
-        cot_content = example["cot_content"].replace("A: Let's think step by step.",
-                                                     "Answer: Let's think step by step.")
+        cot_content = example["cot_content"].replace(
+            "A: Let's think step by step.", "Answer: Let's think step by step."
+        )
         prompt += cot_content + "\n\n"
     else:
         prompt += "Answer: Let's think step by step."
@@ -100,7 +100,7 @@ def generate_cot_prompt(val_df, curr, k):
             prompt += line
     subject = curr["category"]
     val_df = select_by_category(val_df, subject)
-    val_df = val_df[: k]
+    val_df = val_df[:k]
     prompt = prompt.replace("{$}", subject) + "\n"
     for example in val_df:
         prompt += format_cot_example(example, including_answer=True)
@@ -119,7 +119,7 @@ def extract_answer(text):
 
 
 def extract_again(text):
-    match = re.search(r'.*[aA]nswer:\s*([A-J])', text)
+    match = re.search(r".*[aA]nswer:\s*([A-J])", text)
     if match:
         return match.group(1)
     else:
@@ -193,14 +193,18 @@ def eval_cot(subject, model, tokenizer, val_df, test_df, output_path):
             k -= 1
         inference_batches.append(prompt)
 
-    pred_batch, response_batch = batch_inference(llm, sampling_params, lora_request, inference_batches)
+    pred_batch, response_batch = batch_inference(
+        llm, sampling_params, lora_request, inference_batches
+    )
     res = []
     for j, curr in enumerate(test_df):
         curr["pred"] = pred_batch[j]
         curr["model_outputs"] = response_batch[j]
         res.append(curr)
     accu, corr, wrong = save_res(res, output_path)
-    logging.info("this batch accu is: {}, corr: {}, wrong: {}\n".format(str(accu), str(corr), str(wrong)))
+    logging.info(
+        "this batch accu is: {}, corr: {}, wrong: {}\n".format(str(accu), str(corr), str(wrong))
+    )
 
     accu, corr, wrong = save_res(res, output_path)
     return accu, corr, wrong
@@ -229,7 +233,7 @@ def main():
     print("selected subjects:\n" + "\n".join(selected_subjects))
     sta_dict = {}
     selected_subjects = sorted(selected_subjects)
-    with open(os.path.join(summary_path), 'a') as f:
+    with open(os.path.join(summary_path), "a") as f:
         f.write("\n------category level sta------\n")
     for subject in selected_subjects:
         if subject not in sta_dict:
@@ -237,11 +241,13 @@ def main():
         test_df = select_by_category(full_test_df, subject)
         val_df = select_by_category(full_val_df, subject)
         output_path = os.path.join(save_result_dir, "{}.json".format(subject))
-        acc, corr_count, wrong_count = eval_cot(subject, model, tokenizer, val_df, test_df, output_path)
+        acc, corr_count, wrong_count = eval_cot(
+            subject, model, tokenizer, val_df, test_df, output_path
+        )
         sta_dict[subject]["corr"] = corr_count
         sta_dict[subject]["wrong"] = wrong_count
         sta_dict[subject]["accu"] = acc
-        with open(os.path.join(summary_path), 'a') as f:
+        with open(os.path.join(summary_path), "a") as f:
             f.write("Average accuracy {:.4f} - {}\n".format(sta_dict[subject]["accu"], subject))
     total_corr, total_wrong = 0.0, 0.0
     for k, v in sta_dict.items():
@@ -250,11 +256,11 @@ def main():
     total_accu = total_corr / (total_corr + total_wrong + 0.000001)
     sta_dict["total"] = {"corr": total_corr, "wrong": total_wrong, "accu": total_accu}
 
-    with open(os.path.join(summary_path), 'a') as f:
+    with open(os.path.join(summary_path), "a") as f:
         f.write("\n------average acc sta------\n")
         weighted_acc = total_accu
         f.write("Average accuracy: {:.4f}\n".format(weighted_acc))
-    with open(global_record_file, 'a', newline='') as file:
+    with open(global_record_file, "a", newline="") as file:
         writer = csv.writer(file)
         record = args_generate_path(args) + [time_str, weighted_acc]
         writer.writerow(record)
@@ -265,8 +271,9 @@ if __name__ == "__main__":
     parser.add_argument("--ntrain", "-k", type=int, default=5)
     parser.add_argument("--selected_subjects", "-sub", type=str, default="all")
     parser.add_argument("--save_dir", "-s", type=str, default="results")
-    parser.add_argument("--global_record_file", "-grf", type=str,
-                        default="eval_record_collection.csv")
+    parser.add_argument(
+        "--global_record_file", "-grf", type=str, default="eval_record_collection.csv"
+    )
     parser.add_argument("--gpu_util", "-gu", type=str, default="0.8")
     parser.add_argument("--model", "-m", type=str, default="meta-llama/Llama-2-7b-hf")
     parser.add_argument("--lora_path", "-lp", type=str, default=None)
@@ -276,24 +283,25 @@ if __name__ == "__main__":
         raise ValueError(f"LoRA path {args.lora_path} does not exist.")
     os.makedirs(args.save_dir, exist_ok=True)
     global_record_file = args.global_record_file
-    save_result_dir = os.path.join(
-        args.save_dir, "/".join(args_generate_path(args))
-    )
+    save_result_dir = os.path.join(args.save_dir, "/".join(args_generate_path(args)))
     file_prefix = "-".join(args_generate_path(args))
     timestamp = time.time()
-    time_str = time.strftime('%m-%d_%H-%M', time.localtime(timestamp))
+    time_str = time.strftime("%m-%d_%H-%M", time.localtime(timestamp))
     file_name = f"{file_prefix}_{time_str}_summary.txt"
     summary_path = os.path.join(args.save_dir, "summary", file_name)
     os.makedirs(os.path.join(args.save_dir, "summary"), exist_ok=True)
     os.makedirs(save_result_dir, exist_ok=True)
     save_log_dir = os.path.join(args.save_dir, "log")
     os.makedirs(save_log_dir, exist_ok=True)
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s',
-                        handlers=[logging.FileHandler(os.path.join(save_log_dir,
-                                                                   file_name.replace("_summary.txt",
-                                                                                     "_logfile.log"))),
-                                  logging.StreamHandler(sys.stdout)])
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(
+                os.path.join(save_log_dir, file_name.replace("_summary.txt", "_logfile.log"))
+            ),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
 
     main()
-
-
